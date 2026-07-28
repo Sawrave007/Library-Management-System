@@ -38,3 +38,21 @@ group by  b.category
 
 
 
+--1. Books overdue 
+
+select 
+ist.issued_member_id,
+m.member_name,
+b.book_title,
+ist.issued_date,
+rts.return_date,
+DATEDIFF(DAY, ist.issued_date, CAST(GETDATE() AS DATE)) AS overdue_days
+from final.issued_status ist
+inner join final.members m 
+on m.member_id = ist.issued_member_id
+inner join final.books b
+on ist.issued_book_isbn = b.isbn
+left join final.return_status rts
+on rts.issued_id = ist.issued_id
+where rts.return_date is NULL
+	AND DATEDIFF(DAY, ist.issued_date, CAST(GETDATE() AS DATE)) > 30
