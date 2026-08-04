@@ -1,6 +1,5 @@
 import csv
 import re
-from datetime import datetime
 from pathlib import Path
 
 import pyodbc
@@ -18,32 +17,13 @@ DRIVER = "ODBC Driver 18 for SQL Server"
 
 SCHEMA_NAME = "raw"
 
-# How many data rows to scan per column when guessing types.
-# Set to None to scan the entire file (safer, slower on huge files).
+# How many data rows to scan per column, just to size the NVARCHAR column.
+# Set to None to scan the whole file (safer, slower on huge files).
 SAMPLE_ROWS = 50_000
 
-# Fallback text column sizing
 MIN_VARCHAR_LEN = 50
 MAX_VARCHAR_LEN = 4000   # beyond this, NVARCHAR(MAX) is used
 VARCHAR_BUFFER = 1.3     # pad observed max length by this factor
-
-TRUNCATE_EXISTING = True
-
-# Formats checked (in order) when a column looks like a date/time.
-# All values in the column must match the SAME format to qualify —
-# this avoids silently misreading ambiguous dates like 01/02/2024.
-DATE_FORMATS = [
-    ("%Y-%m-%d", "DATE"),
-    ("%Y/%m/%d", "DATE"),
-    ("%m/%d/%Y", "DATE"),
-    ("%d/%m/%Y", "DATE"),
-    ("%d-%m-%Y", "DATE"),
-    ("%m-%d-%Y", "DATE"),
-    ("%Y-%m-%d %H:%M:%S", "DATETIME2"),
-    ("%Y-%m-%dT%H:%M:%S", "DATETIME2"),
-    ("%m/%d/%Y %H:%M:%S", "DATETIME2"),
-    ("%d/%m/%Y %H:%M:%S", "DATETIME2"),
-]
 
 
 # ============================================================
@@ -75,13 +55,8 @@ def dedupe_columns(columns: list[str]) -> list[str]:
 
 
 # ============================================================
-# TYPE INFERENCE
+# COLUMN SIZING (text-only — no type inference)
 # ============================================================
-
-INT_RE = re.compile(r"^-?\d+$")
-DECIMAL_RE = re.compile(r"^-?\d+\.\d+$")
-LEADING_ZERO_RE = re.compile(r"^0\d+$")  # e.g. "00123" -> keep as text
-
 
 def varchar_length_for(max_len: int) -> str:
     if max_len <= 0:
@@ -96,84 +71,23 @@ def varchar_length_for(max_len: int) -> str:
     return "NVARCHAR(MAX)"
 
 
-def detect_date_type(values: list[str]):
-    for fmt, sql_type in DATE_FORMATS:
-        try:
-            for v in values:
-                datetime.strptime(v, fmt)
-            return sql_type
-        except ValueError:
-            continue
-    return None
-
-
-def infer_column_type(values: list[str]) -> str:
-    non_null = [v.strip() for v in values if v is not None and v.strip() != ""]
-
-    if not non_null:
-        return f"NVARCHAR({MIN_VARCHAR_LEN})"
-
-    max_len = max(len(v) for v in non_null)
-
-    # ---- numeric check ----
-    is_numeric = True
-    has_fraction = False
-    max_int_digits = 0
-    max_frac_digits = 0
-
-    for v in non_null:
-        if LEADING_ZERO_RE.match(v):
-            is_numeric = False
-            break
-        if INT_RE.match(v):
-            digits = v.lstrip("-")
-            max_int_digits = max(max_int_digits, len(digits))
-        elif DECIMAL_RE.match(v):
-            digits, frac = v.lstrip("-").split(".")
-            max_int_digits = max(max_int_digits, len(digits))
-            max_frac_digits = max(max_frac_digits, len(frac))
-            has_fraction = True
-        else:
-            is_numeric = False
-            break
-
-    if is_numeric:
-        if not has_fraction:
-            try:
-                max_abs_val = max(abs(int(v)) for v in non_null)
-            except ValueError:
-                max_abs_val = 0
-            return "BIGINT" if max_abs_val > 2_147_483_647 else "INT"
-        else:
-            precision = min(max_int_digits + max_frac_digits, 38)
-            scale = min(max_frac_digits, precision - 1 if precision > 0 else 0)
-            precision = max(precision, scale + 1)
-            return f"DECIMAL({precision},{scale})"
-
-    # ---- date / datetime check ----
-    date_type = detect_date_type(non_null)
-    if date_type:
-        return date_type
-
-    # ---- fallback: text ----
-    return varchar_length_for(max_len)
-
-
-def read_and_infer(csv_path: Path):
-    """Returns (columns, sql_types) for a CSV file."""
+def read_and_size(csv_path: Path):
+    """Returns (columns, sql_types) — every column is NVARCHAR, sized off observed max length."""
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         header = next(reader)
         columns = dedupe_columns([sanitize_identifier(c) for c in header])
 
-        col_values = {col: [] for col in columns}
+        max_lens = [0] * len(columns)
         for i, row in enumerate(reader):
             if SAMPLE_ROWS is not None and i >= SAMPLE_ROWS:
                 break
-            for col, val in zip(columns, row):
-                col_values[col].append(val)
+            for idx, val in enumerate(row):
+                if idx < len(max_lens) and val:
+                    if len(val) > max_lens[idx]:
+                        max_lens[idx] = len(val)
 
-    sql_types = [infer_column_type(col_values[col]) for col in columns]
+    sql_types = [varchar_length_for(m) for m in max_lens]
     return columns, sql_types
 
 
@@ -232,15 +146,15 @@ print(f"Found {len(csv_files)} CSV file(s).")
 
 
 # ============================================================
-# INFER TYPES, CREATE / RESET TABLES
+# SIZE COLUMNS, CREATE / RESET TABLES (all NVARCHAR)
 # ============================================================
 
 table_info = {}  # table_name -> (columns, types)
 
 for csv_file in csv_files:
     table_name = sanitize_identifier(csv_file.stem)
-    print(f"Scanning {csv_file.name} for column types...")
-    columns, sql_types = read_and_infer(csv_file)
+    print(f"Scanning {csv_file.name} for column widths...")
+    columns, sql_types = read_and_size(csv_file)
     table_info[table_name] = (columns, sql_types)
 
     for col, t in zip(columns, sql_types):
@@ -255,9 +169,6 @@ for csv_file in csv_files:
     exists = cursor.fetchone() is not None
 
     if exists:
-        # Types can drift between runs (a column that was clean before
-        # might now have mixed data) so we always drop + recreate rather
-        # than trust an old schema when using typed columns.
         cursor.execute(f"DROP TABLE {SCHEMA_NAME}.{table_name}")
         cursor.execute(build_create_table_sql(SCHEMA_NAME, table_name, columns, sql_types))
         print(f"Recreated {SCHEMA_NAME}.{table_name}")
@@ -297,7 +208,7 @@ for csv_file in csv_files:
         print(f"Loaded {SCHEMA_NAME}.{table_name}")
     except pyodbc.Error as e:
         print(f"WARNING: issues loading {table_name}: {e}")
-        print(f"Check {error_file} for rejected rows (bad type conversions, etc.)")
+        print(f"Check {error_file} for rejected rows.")
 
 
 # ============================================================
